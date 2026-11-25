@@ -325,6 +325,19 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+### Wine / Proton / Linux
+
+Wine's `D3DCompile` (vkd3d-shader) does not build the helper shaders in
+`crates/victory-gpu/src/shaders/` (`E5005: Method 'Load' is not defined on
+type 'RWByteAddressBuffer'`; the plane shaders get no root signature). Without
+them indirect draws are dropped and the depth planes stay as they were: the
+world stays black and empty. Cross-build with
+[`dxc`](https://github.com/microsoft/DirectXShaderCompiler) on the `PATH` (or
+its path in the `DXC` environment variable); `crates/victory-gpu/build.rs`
+then compiles the shaders to DXIL into `OUT_DIR` and embeds them, and they are
+used when `D3DCompile` fails or gives no root signature. Without `dxc` the
+shaders are compiled at first use, as before. Nothing compiled is committed.
+
 ## Commands
 
 ```

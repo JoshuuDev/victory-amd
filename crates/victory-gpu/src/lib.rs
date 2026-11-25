@@ -38,6 +38,7 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod prebuilt;
 mod primitive;
 pub mod query;
 pub mod queue;
