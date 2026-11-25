@@ -834,27 +834,9 @@ struct TwinUse {
 /// the host turns the same float into the same 24 bits. The step divided
 /// by 65535 is another float for 512 of the 65,536 steps (none under 257),
 /// and lands in another 24-bit step for 127 of them (none under 385).
-const PLANE_CORNERS: &str = r#"
-float4 corner(uint i : SV_VertexID) : SV_Position {
-    return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, 0.0, 1.0);
-}
-"#;
-const PLANE_STEPS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
-Texture2DArray<uint> twin : register(t0);
-[RootSignature(RS)]
-float plane(float4 p : SV_Position) : SV_Depth {
-    return float(twin.Load(int4(int2(p.xy), 0, 0))) * asfloat(0x37800080);
-}
-"#;
-const PLANE_FLOATS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
-Texture2DArray<float> twin : register(t0);
-[RootSignature(RS)]
-float plane(float4 p : SV_Position) : SV_Depth {
-    return twin.Load(int4(int2(p.xy), 0, 0));
-}
-"#;
+const PLANE_CORNERS: &str = include_str!("shaders/plane-corner.hlsl");
+const PLANE_STEPS: &str = include_str!("shaders/plane-steps.hlsl");
+const PLANE_FLOATS: &str = include_str!("shaders/plane-floats.hlsl");
 
 /// Views of twins the pass reads, in a heap of ours used as a ring.
 /// shortcut: a view must last until its list has run; with one or two
@@ -986,9 +968,21 @@ impl PlanePass {
     fn make(steps: bool, format: DXGI_FORMAT) -> windows::core::Result<PlanePipeline> {
         use windows::core::s;
         let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-        let vs = compile(PLANE_CORNERS, s!("corner"), s!("vs_5_1"))?;
         let source = if steps { PLANE_STEPS } else { PLANE_FLOATS };
-        let ps = compile(source, s!("plane"), s!("ps_5_1"))?;
+        let prebuilt_ps = if steps { crate::prebuilt::PLANE_STEPS } else { crate::prebuilt::PLANE_FLOATS };
+        let compiled = compile(PLANE_CORNERS, s!("main"), s!("vs_5_1"))
+            .and_then(|vs| compile(source, s!("main"), s!("ps_5_1")).map(|ps| (vs, ps)));
+        let (vs, ps) = match compiled {
+            // SAFETY: the pixel shader's own bytes.
+            Ok((vs, ps)) if prebuilt_ps.is_empty() || unsafe { device.CreateRootSignature::<ID3D12RootSignature>(0, &ps[..]) }.is_ok() => (vs, ps),
+            // Wine's D3DCompile builds no root signature into the pixel
+            // shader, or no shader: use the bytecode `build.rs` made with dxc.
+            Err(e) if prebuilt_ps.is_empty() => return Err(e),
+            _ => {
+                tracing::warn!("depth plane pass: the system compiler gave no usable shaders; using the DXIL built with dxc");
+                (crate::prebuilt::PLANE_CORNER.to_vec(), prebuilt_ps.to_vec())
+            }
+        };
         let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
@@ -1461,52 +1455,12 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
+/// its bytes from before, one group of 64 threads per 64 KiB piece (cut at multiples of
 /// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
 /// gets a dword per piece, 1 where a byte differs. The offsets are widened
 /// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
 /// byte just outside the range costs a fetch that finds nothing.
-pub(crate) const CARD_COMPARE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
-cbuffer Span : register(b0) {
-    uint first;    // the first piece
-    uint skew;     // where the copy starts in its piece 0
-    uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
-    uint pieces;
-    uint out_at;   // the first piece's dword in `differs`, in bytes
-    uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
-};
-ByteAddressBuffer now : register(t0);
-// 16 bytes per piece of the copy: the hash of its bytes when they were
-// last sent up (or hashed whole, the first time).
-RWByteAddressBuffer hashes : register(u0);
-RWByteAddressBuffer differs : register(u1);
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
-    uint lo = piece * 65536u;
-    lo = lo > skew ? lo - skew : 0u;
-    uint hi = min((piece + 1u) * 65536u - skew, size);
-    lo = lo & ~15u;
-    hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
-    [loop]
-    for (uint at = lo; at < hi; at += 16u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
-    }
-    if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
-        // With the copy-back on its own thread: the next compare of the
-        // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
-    } else {
-        hashes.Store4(piece * 16u, h);
-    }
-}
-"#;
+pub(crate) const CARD_COMPARE: &str = include_str!("shaders/card-compare.hlsl");
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -2927,7 +2881,7 @@ impl Host {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
-        unsafe {
+        let compiled = unsafe {
             D3DCompile(
                 CARD_COMPARE.as_ptr().cast(),
                 CARD_COMPARE.len(),
@@ -2940,9 +2894,21 @@ impl Host {
                 0,
                 &mut code,
                 None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+            )
+        };
+        // Wine's D3DCompile does not build it: use the bytecode `build.rs`
+        // made with dxc, when there is some.
+        let compiled_bytes: Vec<u8> = match (compiled, code) {
+            // SAFETY: the blob's own bytes.
+            (Ok(()), Some(code)) => unsafe {
+                std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize()).to_vec()
+            },
+            (Err(e), _) if crate::prebuilt::CARD_COMPARE.is_empty() => return Err(e),
+            _ => {
+                tracing::warn!("card compare: the system compiler failed; using the DXIL built with dxc");
+                crate::prebuilt::CARD_COMPARE.to_vec()
+            }
+        };
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
@@ -2952,7 +2918,7 @@ impl Host {
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
         unsafe {
-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let bytes = &compiled_bytes[..];
             let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
@@ -3096,7 +3062,7 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            list.Dispatch(run.pieces, 1, 1);
                         }
                     }
                     list.Close()?;
@@ -3181,7 +3147,7 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(r.span.pieces, 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
