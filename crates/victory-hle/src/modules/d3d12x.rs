@@ -39,6 +39,13 @@ fn host_gpu_failed(what: &str) -> ! {
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).
+/// The journal of pipelines being made and the list of those refused that
+/// go with a shader cache in `dir` (`victory_gpu::pipeline::quarantine_files`).
+#[cfg(windows)]
+pub fn quarantine_files(dir: &std::path::Path) -> [std::path::PathBuf; 2] {
+    victory_gpu::pipeline::quarantine_files(&dir.with_file_name("pipelines"))
+}
+
 pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(windows)]
     {
@@ -50,7 +57,7 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
 }
 
 #[cfg(windows)]
-pub use victory_gpu::pipeline::{save_pipeline_cache, warm};
+pub use victory_gpu::pipeline::{save_pipeline_cache, warm, warm_with};
 
 pub(crate) fn module() -> HleModule {
     HleModule {

@@ -307,13 +307,146 @@ pub fn run(
 }
 
 /// `victory warm`: fills the caches a run reads (`Command::Warm`).
-pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+/// `victory warm`. Under Wine the work is done by a process of its own
+/// that this one starts again whenever it ends early: making a pipeline of
+/// some of the title's shaders ends the process there (or never returns),
+/// and each such end teaches the next start which pipeline to make alone
+/// or to leave out (`victory-gpu`'s `pipeline::quarantine`). Started by
+/// hand, that took a start or two per such shader; `once` (`--once`) is
+/// one of those starts, and what Windows does unless `VICTORY_WARM_AGAIN=1`
+/// (`0` turns it off under Wine).
+pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool, once: bool) -> Result<()> {
+    let again = match std::env::var("VICTORY_WARM_AGAIN").ok().as_deref() {
+        Some("0") => false,
+        Some(_) => true,
+        None => victory_gpu::wine::version().is_some(),
+    };
+    if once || !pipelines || !again {
+        return warm_once(paths, jobs, pipelines);
+    }
+    let cfg = victory_core::Config::load()?;
+    let [journal, refused] = victory_hle::modules::d3d12x::quarantine_files(&cfg.cache_subdir("shaders")?);
+    // What the files say: a start that ends early and leaves them as the
+    // start before it did has learnt nothing, and the next would not.
+    let state = || (std::fs::read(&journal).unwrap_or_default(), std::fs::read(&refused).unwrap_or_default());
+    let listed = || std::fs::read_to_string(&refused).map_or(0, |l| l.lines().filter(|l| !l.trim().is_empty()).count());
+    // A start that begins and ends no pipeline for this long is taken to
+    // hang in one (`VICTORY_WARM_HANG_S`; the title's slowest known
+    // program is left out under Wine).
+    let hang = std::env::var("VICTORY_WARM_HANG_S").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let hang = std::time::Duration::from_secs(hang);
+    let exe = std::env::current_exe()?;
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    args.push("--once".into());
+    // What the starts have got through, so that each goes on where the
+    // one before it ended (`Progress`).
+    let progress = journal.with_file_name("warm-progress.txt");
+    let _ = std::fs::remove_file(&progress);
+    let mut before = state();
+    for start in 1u32.. {
+        let mut child = std::process::Command::new(&exe).args(&args).env(PROGRESS, &progress).spawn()?;
+        let mut seen = (state(), std::time::Instant::now());
+        let (status, hung) = loop {
+            if let Some(status) = child.try_wait()? {
+                break (status, false);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let now = state();
+            if now != seen.0 {
+                seen = (now, std::time::Instant::now());
+            } else if seen.1.elapsed() > hang {
+                let _ = child.kill();
+                break (child.wait()?, true);
+            }
+        };
+        if status.success() && !hung {
+            let _ = std::fs::remove_file(&progress);
+            if start > 1 {
+                println!("warm         done at start {start}; {} pipelines are left out ({})", listed(), refused.display());
+            }
+            return Ok(());
+        }
+        let after = state();
+        println!(
+            "warm         start {start} {}; {} pipelines left out so far",
+            if hung { "made no pipeline for too long and was ended".to_owned() } else { format!("ended early ({status})") },
+            listed()
+        );
+        if after == before && start > 1 {
+            let _ = std::fs::remove_file(&progress);
+            anyhow::bail!(
+                "warm ends early without a pipeline in the making to blame: start it with --once to see what ends it"
+            );
+        }
+        before = after;
+    }
+    unreachable!("the starts are not counted that far")
+}
+
+/// Names the file a start of `warm` under [`warm`]'s watch keeps its
+/// progress in.
+const PROGRESS: &str = "VICTORY_WARM_PROGRESS";
+
+/// The pipelines the starts before this one got through, by shader
+/// (`stage:hash`, as the quarantine names them) with whether the host took
+/// them, and the file this start adds its own to: a line per pipeline, as
+/// it is done. The translations themselves are in the shader cache.
+struct Progress {
+    done: std::collections::HashMap<String, bool>,
+    file: Option<Mutex<std::fs::File>>,
+}
+
+impl Progress {
+    fn open() -> Progress {
+        let Some(path) = std::env::var_os(PROGRESS) else {
+            return Progress { done: Default::default(), file: None };
+        };
+        let done = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .filter_map(|(name, took)| Some((name.to_owned(), match took { "1" => true, "0" => false, _ => return None })))
+            .collect();
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok().map(Mutex::new);
+        Progress { done, file }
+    }
+
+    fn note(&self, name: &str, took: bool) {
+        if let Some(file) = &self.file {
+            use std::io::Write;
+            let _ = lock(file).write_all(format!("{name} {}\n", u8::from(took)).as_bytes());
+        }
+    }
+}
+
+fn warm_once(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
-    let [done, refused, made, unmade] = [const { AtomicUsize::new(0) }; 4];
+    let [done, refused, made, unmade, alone_made, alone_unmade, left_out] = [const { AtomicUsize::new(0) }; 7];
+    // Under Wine every shader of the other stages is made into a host
+    // pipeline too, alone, with stand-ins for the stages it lacks: making
+    // one of some of the title's shaders ends the process there, and this
+    // is where that is found out and noted for the runs (`victory-gpu`'s
+    // `pipeline::quarantine`), instead of in the world's first frames.
+    // `VICTORY_WARM_STAGES=1` does it on Windows as well, `0` nowhere.
+    let stages = pipelines
+        && match std::env::var("VICTORY_WARM_STAGES").ok().as_deref() {
+            Some("0") => false,
+            Some(_) => true,
+            None => victory_gpu::wine::version().is_some(),
+        };
+    let stages = stages
+        && match Host::new(false) {
+            Ok(_) => true,
+            Err(why) => {
+                println!("warm         no device for the other stages' pipelines ({why}): only compute pipelines are made");
+                false
+            }
+        };
+    let progress = Progress::open();
     let started = std::time::Instant::now();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
@@ -328,6 +461,19 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
                     s.spawn(|| {
+                        // A device of this thread's own for the pipelines
+                        // made alone, as `translate --pipelines` has.
+                        let host = stages.then(|| Host::new(false).ok().map(|h| (h, host::stub_ps()))).flatten();
+                        let alone = |shader: &emit::HostShader| -> bool {
+                            let Some((h, stub_ps)) = &host else { return false };
+                            match shader.stage {
+                                HwStage::Vs => h.pipeline(shader, stub_ps).is_ok(),
+                                HwStage::Ms => h.mesh_pipeline(shader, stub_ps).is_ok(),
+                                HwStage::Ps => host::stub_vs(shader).and_then(|vs| h.pipeline(&vs, shader).map(drop)).is_ok(),
+                                _ => false,
+                            }
+                        };
+                        let alone: Option<&dyn Fn(&emit::HostShader) -> bool> = host.is_some().then_some(&alone);
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             let Some(bytes) = job.bytes() else { continue };
                             let Ok(container) = Container::parse(&bytes) else { continue };
@@ -349,12 +495,30 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                             });
                             let Some(stage) = stage else { continue };
                             let compute = pipelines && stage == "compute";
-                            let (translated, pipeline) = victory_hle::modules::d3d12x::warm(stage, bytes, compute);
+                            let name = format!("{stage}:{}", &blake3::hash(bytes).to_hex()[..16]);
+                            // Got through by an earlier start: counted, not
+                            // done again. Not so a compute pipeline, which is
+                            // made to be kept and is only in the library of
+                            // the start that ends in order.
+                            let (translated, pipeline) = match progress.done.get(&name) {
+                                Some(&took) if stage != "compute" => (true, Some(took)),
+                                _ => {
+                                    let got = victory_hle::modules::d3d12x::warm_with(stage, bytes, compute, alone);
+                                    if let Some(took) = got.1
+                                        && stage != "compute"
+                                    {
+                                        progress.note(&name, took);
+                                    }
+                                    got
+                                }
+                            };
                             let count = if translated { &done } else { &refused };
                             let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+                            let counts = if stage == "compute" { [&made, &unmade] } else { [&alone_made, &alone_unmade] };
                             match pipeline {
-                                Some(true) => made.fetch_add(1, Ordering::Relaxed),
-                                Some(false) => unmade.fetch_add(1, Ordering::Relaxed),
+                                Some(true) => counts[0].fetch_add(1, Ordering::Relaxed),
+                                Some(false) => counts[1].fetch_add(1, Ordering::Relaxed),
+                                None if translated && (compute || stages) => left_out.fetch_add(1, Ordering::Relaxed),
                                 None => 0,
                             };
                             if n.is_multiple_of(2000) {
@@ -375,6 +539,17 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         unmade.into_inner(),
         started.elapsed().as_secs_f64()
     );
+    if stages {
+        println!(
+            "             {} vertex, pixel and mesh shaders made into a pipeline alone, {} refused by the host",
+            alone_made.into_inner(),
+            alone_unmade.into_inner()
+        );
+    }
+    let left_out = left_out.into_inner();
+    if left_out != 0 {
+        println!("             {left_out} left out (ray-tracing resolves, or listed in the cache's pipelines/refused.txt)");
+    }
     Ok(())
 }
 
