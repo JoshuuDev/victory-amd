@@ -112,7 +112,13 @@ translate), one `victory warm` from an empty cache:
 | Proton | Compute pipelines made | Other shaders made alone | Left out by the quarantine |
 |--------|------------------------|--------------------------|----------------------------|
 | Experimental 11.0-20261112 | 1,723 | 22,961, none refused by the host | 3 compute programs, in each of which the conversion does not return |
-| Proton-CachyOS 11.0-20261015 | not finished when this was written | not finished | 26 pixel shaders (RADV faults on the SPIR-V) and 2 compute programs so far |
+| Proton-CachyOS 11.0-20261015 | not finished when this was written | 22,900 or so | 26 pixel shaders (RADV faults on the SPIR-V) and 8 compute programs so far |
+
+With Experimental's vkd3d-proton the same three programs hang with the
+shape of the code as above and without it (`VICTORY_SHADER_OPT=63`), and
+nothing else fails either way: the shape is for older conversions, such as
+Proton-CachyOS's of October, where it took the compute programs that fault
+from 7 in 100 to none in 410.
 
 **Which vkd3d-proton it is matters more than anything here**: use the
 newest. With Experimental's, `warm` took about 45 minutes, nearly all of it
