@@ -16,11 +16,10 @@ Proton-CachyOS 11.0-20261015.
 | Build on Linux | works, without Microsoft's SDK (`tools/linux/cross-env.sh`) |
 | `cargo test --workspace` under Proton | passes: the loader's stand-in title is mapped, bound and called; the translated shaders of the tests run on the card and give the reference values |
 | `victory warm` over a title's archives | completes; see "Pipelines that end the process" for the ones left out |
-| The title itself (`victory run --execute`) | **not run.** The dump at hand had no executable. Everything a run needs before the title's first instruction is covered by the tests above; what the title then does to Wine's memory manager, its threads and vkd3d-proton at full load is not known |
+| The title itself (`victory run --execute`) | starts: boot, the first-boot screens and the intro video are drawn, 30 fps, two runs of 7 and 9 minutes without a fault (Proton Experimental). **Not taken further than the legal terms screen**, so nothing is known of the world on Linux: how it draws, how fast, how long it holds |
 
-So: it builds, starts, loads and makes its pipelines on Linux. Whether the
-world draws as on Windows, and how fast, is for whoever runs it first with
-a whole dump to say.
+So: it builds, starts, loads, makes its pipelines and runs its menus on
+Linux. The world is for whoever goes on from the legal screens to say.
 
 ## Building
 
@@ -176,7 +175,8 @@ folder, and those tests then fail to find the repository).
 
 ## Not looked at
 
-- Frame times. The Windows numbers in the README are not Linux numbers.
-- Input (XInput under Wine), audio (XAudio2 under Wine), the window and
-  presentation through DXVK's DXGI.
+- Frame times in the world. The Windows numbers in the README are not
+  Linux numbers.
+- Input from a pad (the runs were driven by `VICTORY_KEYS`), and whether
+  the sound that is decoded is heard.
 - NVIDIA and Intel cards; any Mesa but 26.3.

@@ -120,9 +120,10 @@ On branch `linux-wine`: VIctory builds on Linux for Windows without
 Microsoft's SDK and runs under Proton's wine with vkd3d-proton. Its tests
 pass there, the translated shaders of the tests giving the reference values
 on a Radeon under RADV, and `victory warm` goes through the title's
-archives. **The title itself was not run on Linux**: the dump at hand had
-no executable. [docs/linux.md](docs/linux.md) has the state, how to build
-and run, and what was changed for it:
+archives. The title starts there: its first-boot screens and intro video
+are drawn at 30 fps. **It was not taken into the world on Linux.**
+[docs/linux.md](docs/linux.md) has the state, how to build and run, and
+what was changed for it:
 
 - **Shaders that ended the process.** Under Wine a translated program goes
   through vkd3d-proton's conversion to SPIR-V and the Vulkan driver's
