@@ -41,7 +41,9 @@ pub(crate) struct Pending {
 
 /// Why a pipeline with these shaders is not made, if it is not.
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    if without_structures(shaders) {
+    if super::quarantine::refused(shaders) {
+        Some("ended an earlier run while being made, left out")
+    } else if without_structures(shaders) {
         Some("shades ray-tracing hits, left out")
     } else if too_dear(shaders) {
         Some("too dear to compile, left out")
@@ -64,9 +66,18 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 /// 0.8 GB more every 10 s for it and did not finish (RX 7800 XT: 47 GB after
 /// 8 minutes); cleaned up, it takes 85 s and 1.3 GB, once.
 /// `VICTORY_ACTIVATE_RAYS=0` leaves it out.
+///
+/// Under Wine it is left out unless `VICTORY_ACTIVATE_RAYS=1`: there the
+/// program goes through vkd3d-proton's conversion to SPIR-V first, which
+/// (Proton 11, RX 7900 GRE on RADV) had not finished it after 40 minutes
+/// of a core, and with the loops left one way (`bitcode::exits`) ran out
+/// of a stack of 256 MiB.
 fn too_dear(shaders: &[Arc<Shader>]) -> bool {
     static OUT: OnceLock<bool> = OnceLock::new();
-    let out = *OUT.get_or_init(|| std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0"));
+    let out = *OUT.get_or_init(|| match std::env::var_os("VICTORY_ACTIVATE_RAYS") {
+        Some(v) => v == "0",
+        None => crate::wine::version().is_some(),
+    });
     out && named(shaders, b"CS_ScreenProbes_ActivateRays")
 }
 

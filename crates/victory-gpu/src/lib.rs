@@ -56,6 +56,8 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+pub mod wine;
 
 #[cfg(windows)]
 pub use host::on_failure;

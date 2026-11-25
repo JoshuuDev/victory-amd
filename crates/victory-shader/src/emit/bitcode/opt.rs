@@ -52,10 +52,14 @@ pub const LOADS: u32 = 16;
 /// half has a lane where every lane is in EXEC (`lower.rs`,
 /// `v_readfirstlane_b32`).
 pub const FIRST: u32 = 32;
+/// Not a clean-up: one block returns, and a loop is left towards one
+/// block (`bitcode::exits`), the shape vkd3d-proton's structuriser can
+/// rely on.
+pub const EXITS: u32 = 64;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
-pub const ALL: u32 = MODULE | FIRST;
+pub const ALL: u32 = MODULE | FIRST | EXITS;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -157,7 +161,7 @@ fn resolve(repl: &[Option<V>], mut v: V) -> V {
 }
 
 /// Replaces every value `op` reads by `f` of it.
-fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
+pub(super) fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
     match op {
         Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
             *a = f(*a);
@@ -1127,19 +1131,19 @@ impl Module {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// `main` with one block and a function of each kind of effect.
-    struct Kit {
-        m: Module,
-        b: usize,
-        pure: V,
-        reads: V,
-        writes: V,
+    pub(in crate::emit::bitcode) struct Kit {
+        pub m: Module,
+        pub b: usize,
+        pub pure: V,
+        pub reads: V,
+        pub writes: V,
     }
 
-    fn kit() -> Kit {
+    pub(in crate::emit::bitcode) fn kit() -> Kit {
         let mut m = Module::default();
         let i32t = m.int(32);
         let void = m.void();
@@ -1633,7 +1637,7 @@ mod tests {
 
     /// Runs `m` on `inputs`: the stores it makes, in order (and how it
     /// ended). Reads a value before its definition ran: a panic.
-    fn run(m: &Module, inputs: &[u32]) -> Vec<(String, Vec<u64>)> {
+    pub(in crate::emit::bitcode) fn run(m: &Module, inputs: &[u32]) -> Vec<(String, Vec<u64>)> {
         let mut vals: Vec<Option<u64>> = vec![None; m.insts.len()];
         let mut memory = [0u64; 16];
         let mut trace = Vec::new();

@@ -4,9 +4,9 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So active records are copied and clamped
 //! on the GPU into a device-local scratch buffer, just before execution, by a
-//! compute shader of ours (HLSL compiled by the system's compiler; a 5.1
-//! shader with its root signature inside), leaving the title's argument and
-//! count buffers untouched.
+//! compute shader of ours (HLSL compiled by the system's compiler, a 5.1
+//! shader; its root signature is made beside it), leaving the title's
+//! argument and count buffers untouched.
 //!
 //! When a count buffer is given, threads at or past `min(max, count)` return
 //! immediately without charging the list's budget or reading uninitialized
@@ -21,14 +21,21 @@
 //! the title needs more.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use windows::Win32::Graphics::Direct3D::{D3D_SHADER_MACRO, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{HostList, host, root_constants, root_signature, root_view, transition};
 
+/// The clamp. Its root signature is [`clamp_root`].
+///
+/// The buffers are structured ones of dwords, of which both compilers the
+/// system may have know the same (Wine's knows no method of a byte-address
+/// buffer). The lists bind them by address as before; the addresses and
+/// every byte offset and stride here are multiples of 4 (`validate_layout`
+/// and `record_clamp_as` refuse the rest), so the dword at byte offset `at`
+/// is element `at >> 2`.
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -41,34 +48,35 @@ cbuffer Record : register(b0) {
     uint has_count;
     uint count_offset;
 };
-ByteAddressBuffer src_args : register(t0);
-ByteAddressBuffer count_buf : register(t1);
-RWByteAddressBuffer dst_args : register(u0);
+StructuredBuffer<uint> src_args : register(t0);
+StructuredBuffer<uint> count_buf : register(t1);
+RWStructuredBuffer<uint> dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
-RWByteAddressBuffer budget : register(u1);
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 static const uint SPLIT = 2;
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     bool split = (has_count & 4u) != 0;
     if ((has_count & 1u) != 0) {
-        eff_count = min(eff_count, count_buf.Load(count_offset));
+        eff_count = min(eff_count, count_buf[count_offset >> 2]);
     }
     if (id.x >= eff_count) return;
-    uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    // In dwords from here on.
+    uint words = stride >> 2;
+    uint src_at = (args_offset + id.x * stride) >> 2;
+    uint dst_at = id.x * words;
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint2 asked = src_args.Load2(src_at);
+        uint2 asked = uint2(src_args[src_at], src_args[src_at + 1]);
         if (ahead && (asked.x > (1u << 24) || asked.y > (1u << 24))) {
             asked = uint2(0, 0);
         }
@@ -77,7 +85,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = count * instances;
         draw_counts = uint2(count, instances);
     } else if (kind == 2) {
-        uint3 asked = src_args.Load3(src_at);
+        uint3 asked = uint3(src_args[src_at], src_args[src_at + 1], src_args[src_at + 2]);
         uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
         // In parts: one dimension, and not the garbage of an argument
         // nothing wrote.
@@ -92,7 +100,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         groups = g;
     } else {
         // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = src_args.Load3(src_at);
+        uint3 g = uint3(src_args[src_at], src_args[src_at + 1], src_args[src_at + 2]);
         // Ahead of its draw, a record over the most a dispatch runs is a
         // slot the title has not filled (the title leaves all
         // ones there): empty, and not counted below either.
@@ -102,8 +110,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Diagnostics, in the budget buffer's next words: the largest
         // group count a mesh record asked for, and the groups asked in all.
         uint was;
-        budget.InterlockedMax(4, g.x, was);
-        budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+        InterlockedMax(budget[1], g.x, was);
+        InterlockedAdd(budget[2], min(g.x, 1u << 24), was);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         groups = g;
@@ -111,12 +119,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     bool over = false;
     if (cost > 0) {
         uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
+        InterlockedOr(budget[0], 0, before);
+        UAV_CONDITION
         while (before < BUDGET) {
             uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
             uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
+            InterlockedCompareExchange(budget[0], before, next, prev);
             if (prev == before) break;
             before = prev;
         }
@@ -126,9 +134,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (over) {
             draw_counts = uint2(0, 0);
         }
-        dst_args.Store2(dst_at, draw_counts);
-        for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        dst_args[dst_at] = draw_counts.x;
+        dst_args[dst_at + 1] = draw_counts.y;
+        for (uint w = 2; w < words; w++) {
+            dst_args[dst_at + w] = src_args[src_at + w];
         }
     } else {
         if (over) {
@@ -138,13 +147,17 @@ void main(uint3 id : SV_DispatchThreadID) {
             for (uint part = 0; part < SPLIT; part++) {
                 uint before = part * 65535u;
                 uint x = groups.x > before ? min(groups.x - before, 65535u) : 0u;
-                dst_args.Store3(dst_at + part * 12u, uint3(x, groups.yz));
+                dst_args[dst_at + part * 3u] = x;
+                dst_args[dst_at + part * 3u + 1] = groups.y;
+                dst_args[dst_at + part * 3u + 2] = groups.z;
             }
             return;
         }
-        dst_args.Store3(dst_at, groups);
-        for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        dst_args[dst_at] = groups.x;
+        dst_args[dst_at + 1] = groups.y;
+        dst_args[dst_at + 2] = groups.z;
+        for (uint w = 3; w < words; w++) {
+            dst_args[dst_at + w] = src_args[src_at + w];
         }
     }
 }
@@ -178,16 +191,45 @@ fn make() -> windows::core::Result<Clamp> {
     make_for(device)
 }
 
+/// [`SOURCE`]'s root signature:
+/// "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)".
+fn clamp_root(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    root_signature(
+        device,
+        &[
+            root_constants(6, 0),
+            root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+            root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 1),
+            root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+            root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
+        ],
+    )
+}
+
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    // The loop that charges the budget ends on what it read through an
+    // unordered-access view. Microsoft's compiler wants that allowed by an
+    // attribute; Wine's knows the attribute and stops at it ("E5017:
+    // Aborting due to not yet implemented feature"), and builds the loop
+    // without it.
+    let allowed = if crate::wine::compiler_is_builtin() { s!("") } else { s!("[allow_uav_condition]") };
+    let defines = [
+        D3D_SHADER_MACRO {
+            Name: s!("UAV_CONDITION"),
+            Definition: allowed,
+        },
+        D3D_SHADER_MACRO::default(),
+    ];
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
+    // SAFETY: the source, names and definitions (ended by an empty one)
+    // live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
             SOURCE.as_ptr().cast(),
             SOURCE.len(),
             s!("clamp"),
-            None,
+            Some(defines.as_ptr()),
             None,
             s!("main"),
             s!("cs_5_1"),
@@ -211,11 +253,11 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    let root = clamp_root(device)?;
+    // SAFETY: the blob's own bytes.
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -474,14 +516,13 @@ mod tests {
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
 
+    // Its root signature: "UAV(u0)".
     const WORKER_CS: &str = r#"
-#define RS "UAV(u0)"
-RWByteAddressBuffer hits : register(u0);
-[RootSignature(RS)]
+RWStructuredBuffer<uint> hits : register(u0);
 [numthreads(1, 1, 1)]
 void main() {
     uint prev;
-    hits.InterlockedAdd(0, 1, prev);
+    InterlockedAdd(hits[0], 1, prev);
 }
 "#;
 
@@ -526,7 +567,9 @@ void main() {
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
                 let clamp = make_for(&device).expect("clamp shader must compile on WARP");
-                let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
+                let hits = root_signature(&device, &[root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0)])
+                    .expect("worker root signature");
+                let worker = compile_cs(&device, WORKER_CS, hits).expect("worker shader must compile");
                 Some(Self {
                     device,
                     queue,
@@ -660,7 +703,11 @@ void main() {
         }
     }
 
-    fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    fn compile_cs(
+        device: &ID3D12Device,
+        source: &str,
+        root: ID3D12RootSignature,
+    ) -> windows::core::Result<Clamp> {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: source and entry names outlive `D3DCompile`.
         unsafe {
@@ -682,7 +729,6 @@ void main() {
                 code.GetBufferPointer().cast::<u8>(),
                 code.GetBufferSize(),
             );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
             let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
@@ -708,7 +754,9 @@ void main() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let root = crate::host::card_compare_root(&warp.device).expect("the card compare's root signature");
+        let compare =
+            compile_cs(&warp.device, crate::host::CARD_COMPARE, root).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;

@@ -95,6 +95,10 @@ enum Command {
         /// Only translate: no host pipelines.
         #[arg(long)]
         no_pipelines: bool,
+        /// One start only, where `warm` would start itself again after a
+        /// pipeline that ends the process (as it does under Wine).
+        #[arg(long)]
+        once: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -174,7 +178,7 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
+        Command::Warm { paths, jobs, no_pipelines, once } => translate::warm(paths, jobs, !no_pipelines, once),
         Command::Run {
             exe,
             unimplemented,

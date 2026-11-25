@@ -385,6 +385,8 @@ impl HostPipeline {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
+        // And for the next run, should this one end here.
+        let _making = super::quarantine::making(shaders);
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),

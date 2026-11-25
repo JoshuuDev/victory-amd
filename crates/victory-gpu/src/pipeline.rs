@@ -127,6 +127,23 @@ pub(crate) use host::depth_bounds_test;
 /// (`None`: not asked for, or left out).
 #[cfg(windows)]
 pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Option<bool>) {
+    warm_with(stage, container, compute, None)
+}
+
+/// As [`warm`], and a shader of another stage is handed to `alone`, which
+/// makes a host pipeline of it with stand-ins for the stages it lacks and
+/// says whether the host took it. Such a pipeline is kept nowhere: it is
+/// made to find out, before a run, whether making one of this shader ends
+/// the process ([`quarantine`]): under Wine some of the title's shaders do,
+/// in vkd3d-proton's conversion or in the Vulkan driver, with any state.
+/// `None` for a shader already refused.
+#[cfg(windows)]
+pub fn warm_with(
+    stage: &'static str,
+    container: &[u8],
+    compute: bool,
+    alone: Option<&dyn Fn(&victory_shader::emit::HostShader) -> bool>,
+) -> (bool, Option<bool>) {
     let full = blake3::hash(container);
     // Not through the table, which lets nothing go.
     let shader = Arc::new(Shader {
@@ -135,9 +152,21 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         container: container.to_vec(),
         translated: OnceLock::new(),
     });
-    let translated = shader.translated().is_some();
-    let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
-    (translated, made)
+    let Some(translated) = shader.translated() else {
+        return (false, None);
+    };
+    let made = if stage == "compute" {
+        compute.then(|| make::warm(vec![shader.clone()])).flatten()
+    } else if let Some(alone) = alone {
+        let shaders = [shader.clone()];
+        (!quarantine::refused(&shaders)).then(|| {
+            let _making = quarantine::making(&shaders);
+            alone(&translated.host)
+        })
+    } else {
+        None
+    };
+    (true, made)
 }
 
 /// A translated shader and the console resources its code reads.
@@ -715,6 +744,8 @@ pub(crate) mod host;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]
+mod quarantine;
+#[cfg(windows)]
 mod make;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
@@ -738,10 +769,21 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
     library::use_pipeline_cache(dir);
 }
 
+/// The journal of pipelines being made and the list of those refused, in
+/// the folder given to [`use_pipeline_cache`] (`quarantine`): what tells a
+/// watcher of a run whether it is still making pipelines, and which ones
+/// ended it.
+#[cfg(windows)]
+pub fn quarantine_files(dir: &std::path::Path) -> [std::path::PathBuf; 2] {
+    quarantine::files(dir)
+}
+
 /// Saves the pipeline cache now if anything was added (at the end of a run).
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+    // The run ends in order: no pipeline in the making is to blame.
+    quarantine::closing();
 }
 
 #[cfg(test)]

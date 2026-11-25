@@ -59,6 +59,8 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
+    crate::wine::keep_host_cache_in(&dir);
+    super::quarantine::open(&dir);
     let _ = DIR.set(dir);
 }
 
@@ -453,6 +455,28 @@ fn library() -> Option<&'static Library> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
+        if bytes.is_empty() {
+            // An empty library is asked for with no blob at all. The safe
+            // wrapper passes an empty slice's (non-null) pointer with length
+            // 0, which Windows takes and vkd3d-proton (Wine, Proton) refuses
+            // with E_INVALIDARG: there no library was made, and no pipeline
+            // was kept between runs.
+            let mut library: Option<ID3D12PipelineLibrary> = None;
+            // SAFETY: the device's own method, with the null blob and zero
+            // length the API documents for an empty library; the out
+            // pointer is ours and typed as the interface asked for.
+            unsafe {
+                (Interface::vtable(device).CreatePipelineLibrary)(
+                    Interface::as_raw(device),
+                    std::ptr::null(),
+                    0,
+                    &ID3D12PipelineLibrary::IID,
+                    (&raw mut library).cast(),
+                )
+                .ok()?;
+            }
+            return library.ok_or_else(windows::core::Error::empty)?.cast();
+        }
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
             device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
