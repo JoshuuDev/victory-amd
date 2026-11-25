@@ -1388,3 +1388,79 @@ fn permlanex16_reads_the_other_row() {
         assert_eq!(got, want, "{backend} case {i}: lane {lane}");
     });
 }
+
+#[test]
+fn v_fma_f16_rounds_once_to_nearest() {
+    // IEEE binary16 nearest-even results, rounded only after a*b+c.
+    let vectors: [([u32; 4], Option<u32>); 24] = [
+        // Exact and near-midpoint results.
+        ([0x3c00, 0x4000, 0x3c00, 0], Some(0x4200)),
+        ([0x6a00, 0x3c01, 0x8400, 0], Some(0x6a01)),
+        ([0x6a00, 0x3c01, 0x0400, 0], Some(0x6a02)),
+        ([0xea00, 0x3c01, 0x0400, 0], Some(0xea01)),
+
+        // Signed zeros and exact cancellation.
+        ([0x0000, 0x3c00, 0x0000, 0], Some(0x0000)),
+        ([0x8000, 0x3c00, 0x8000, 0], Some(0x8000)),
+        ([0x8000, 0x3c00, 0x0000, 0], Some(0x0000)),
+        ([0x3c00, 0x3c00, 0xbc00, 0], Some(0x0000)),
+
+        // Subnormals and underflow.
+        ([0x0001, 0x3800, 0x0000, 0], Some(0x0000)),
+        ([0x8001, 0x3800, 0x8000, 0], Some(0x8000)),
+        ([0x0003, 0x3800, 0x0000, 0], Some(0x0002)),
+        ([0x0400, 0x3800, 0x0000, 0], Some(0x0200)),
+        ([0x03ff, 0x3c00, 0x0001, 0], Some(0x0400)),
+        ([0x0001, 0x3800, 0x0001, 0], Some(0x0002)),
+
+        // Overflow boundaries.
+        ([0x7bff, 0x3c00, 0x4800, 0], Some(0x7bff)),
+        ([0x7bff, 0x3c00, 0x4c00, 0], Some(0x7c00)),
+        ([0xfbff, 0x3c00, 0xcc00, 0], Some(0xfc00)),
+
+        // Infinity.
+        ([0x7c00, 0x3c00, 0x3c00, 0], Some(0x7c00)),
+        ([0xfc00, 0x3c00, 0x3c00, 0], Some(0xfc00)),
+        ([0x3c00, 0x3c00, 0x7c00, 0], Some(0x7c00)),
+
+        // NaN classification, independent of payload.
+        ([0x7c00, 0x0000, 0x3c00, 0], None),
+        ([0x7c00, 0x3c00, 0xfc00, 0], None),
+        ([0x7e00, 0x3c00, 0x3c00, 0], None),
+        ([0x3c00, 0x3c00, 0x7e00, 0], None),
+    ];
+
+    let cases: Vec<[u32; 4]> = vectors.iter().map(|v| v.0).collect();
+    let words = vop3(0x34b, 0, vgpr(1), vgpr(2), vgpr(3));
+
+    let was = lower::TEST_F16_NEAREST.replace(Some(true));
+    let shader = build_valu_cs(&words);
+    lower::TEST_F16_NEAREST.set(was);
+
+    let mut executed = 0;
+
+    run_cases_on(
+        &shader,
+        &cases,
+        &[("hardware", false)],
+        |backend, i, inputs, output| {
+            let got = output & 0xffff;
+            let correct = match vectors[i].1 {
+                Some(expected) => got == expected,
+                None => is_f16_nan(got as u16),
+            };
+
+            assert!(
+                correct,
+                "{backend} case {i}: {:04x} * {:04x} + {:04x} = {got:04x}, expected {:?}",
+                inputs[0], inputs[1], inputs[2], vectors[i].1
+            );
+
+            executed += 1;
+        },
+    );
+
+    if executed != 0 {
+        eprintln!("FP16 FMA nearest-even: {executed}/{} correct", cases.len());
+    }
+}
