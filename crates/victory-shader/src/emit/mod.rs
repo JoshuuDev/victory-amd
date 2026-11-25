@@ -173,31 +173,51 @@ pub fn group_sync() -> u8 {
 /// is exact, so the switch is for telling a translator fault from a
 /// clean-up fault, and for measuring what the clean-up is worth.
 /// `VICTORY_SHADER_OPT`:
-/// - unset: every pass.
+/// - unset: every pass; 64 only under Wine.
 /// - `0`: none (the module as the lowering made it).
 /// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
 ///   and identities, 4 one instruction for one value, 8 what a branch taken
 ///   says about its condition, 16 one read for one place within a block,
 ///   32 a first-lane read of two host waves without the round that asks
-///   which half has a lane (where every lane has one).
+///   which half has a lane (where every lane has one), 64 one block that
+///   returns and one way out of each loop (not a clean-up: without it
+///   vkd3d-proton writes SPIR-V for some programs that RADV faults on;
+///   Windows drivers take the code either way and are left what they
+///   were given so far).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref(), host_is_wine()))
 }
 
-/// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
-/// unreadable. Pure, for testing.
-fn parse_shader_opt(value: Option<&str>) -> u32 {
+/// Whether the host is Wine (its ntdll says so): there our DXIL is not
+/// the driver's to read but vkd3d-proton's to convert.
+pub fn host_is_wine() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: ntdll is in every process; only whether the export is
+        // there is asked.
+        unsafe { GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr().cast()), c"wine_get_version".as_ptr().cast()).is_some() }
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+/// `VICTORY_SHADER_OPT`'s value; when it is unset or unreadable, every
+/// pass, the shape for vkd3d-proton (`bitcode::opt::EXITS`) among them only
+/// under Wine. Pure, for testing.
+fn parse_shader_opt(value: Option<&str>, wine: bool) -> u32 {
     let parsed = value
         .map(str::trim)
         .and_then(|v| match v.strip_prefix("0x") {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
         });
-    parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
+    let unset = if wine { bitcode::opt::ALL } else { bitcode::opt::ALL & !bitcode::opt::EXITS };
+    parsed.map_or(unset, |n| n & bitcode::opt::ALL)
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -763,12 +783,20 @@ mod tests {
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let all = super::bitcode::opt::ALL;
-        assert_eq!(parse_shader_opt(None), all);
-        assert_eq!(parse_shader_opt(Some("0")), 0);
-        assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
-        assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
-        assert_eq!(parse_shader_opt(Some("on")), all);
+        let exits = super::bitcode::opt::EXITS;
+        assert_eq!(parse_shader_opt(None, true), all);
+        // The shape for vkd3d-proton is not given to Windows drivers
+        // unasked.
+        assert_eq!(parse_shader_opt(None, false), all & !exits);
+        assert_eq!(parse_shader_opt(Some("on"), false), all & !exits);
+        assert_eq!(parse_shader_opt(Some("64"), false), exits);
+        for wine in [false, true] {
+            assert_eq!(parse_shader_opt(Some("0"), wine), 0);
+            assert_eq!(parse_shader_opt(Some(" 1 "), wine), 1);
+            assert_eq!(parse_shader_opt(Some("0x1"), wine), 1);
+            assert_eq!(parse_shader_opt(Some("0xffffffff"), wine), all);
+        }
+        assert_eq!(parse_shader_opt(Some("on"), true), all);
     }
 
     #[test]
@@ -1058,7 +1086,11 @@ mod tests {
         host.pipeline(&vs, &ps).unwrap();
         // The runtime checks the container hash: no hash or a wrong one is
         // refused. (Recent runtimes also take sixteen 0x01 bytes, a bypass
-        // value; ours works with older ones too.)
+        // value; ours works with older ones too.) Wine's Direct3D 12
+        // (vkd3d-proton) does not look at the hash at all.
+        if host_is_wine() {
+            return;
+        }
         let mut wrong = ps.dxil[4..20].to_vec();
         wrong[0] ^= 1;
         for digest in [&[0u8; 16][..], &wrong] {

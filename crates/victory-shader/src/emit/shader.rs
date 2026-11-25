@@ -474,6 +474,12 @@ impl Shader {
                 }
             }
         }
+        // After the clean-up, which may take a way out of a loop away: one
+        // block returns and each loop is left towards one block.
+        if super::shader_opt() & super::bitcode::opt::EXITS != 0 {
+            self.m.one_exit();
+            self.m.one_way_out_of_loops();
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
