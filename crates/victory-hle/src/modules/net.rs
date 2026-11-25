@@ -1053,6 +1053,10 @@ mod tests {
         // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
         // them only when the host really lacks them.
         const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
+        // Nor does Wine's ws2_32.dll have all of Windows' (Wine 11 has no
+        // `WSAConnectByList`, Proton 11 no `GetAddrInfoExA` either): there
+        // an override may name an export the host lacks.
+        let wine = victory_gpu::wine::version().is_some();
         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
@@ -1060,7 +1064,7 @@ mod tests {
                 "ws2_32.dll"
             };
             let present = crate::host::function(dll, e.name).is_some();
-            if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
+            if !present && (wine || NEWER_WINDOWS_ONLY.contains(&e.name)) {
                 continue;
             }
             assert!(present, "{dll} lacks {}", e.name);

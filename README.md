@@ -114,6 +114,31 @@ To repeat it without a controller: copy `saves` and `storage` from the data fold
 stopped before the first autosave into a new data folder. Setup and legal screens are then
 done, and the story starts from the beginning again.
 
+### Linux (Wine, Proton)
+
+On branch `linux-wine`: VIctory builds on Linux for Windows without
+Microsoft's SDK and runs under Proton's wine with vkd3d-proton. Its tests
+pass there, the translated shaders of the tests giving the reference values
+on a Radeon under RADV, and `victory warm` goes through the title's
+archives. **The title itself was not run on Linux**: the dump at hand had
+no executable. [docs/linux.md](docs/linux.md) has the state, how to build
+and run, and what was changed for it:
+
+- **Shaders that ended the process.** Under Wine a translated program goes
+  through vkd3d-proton's conversion to SPIR-V and the Vulkan driver's
+  compiler inside our process; for some of the title's programs that
+  faulted or never returned. A translated program now returns from one
+  block and leaves each loop towards one block (as the DXIL compiler's
+  output does), which the conversion takes far more often; and a journal in
+  the cache finds the pipelines that still end a run and leaves them out
+  from the next run on (`pipelines/refused.txt`).
+- **`victory warm` tries every shader** under Wine, not only the compute
+  programs, so that those are found before a run.
+- **Our own HLSL builds with Wine's compiler** as with Microsoft's
+  (structured buffers, root signatures made in code).
+- **The pipeline library is kept** between runs under vkd3d-proton too (an
+  empty one is asked for with a null blob).
+
 ## victory-amd
 
 This copy is a fork of

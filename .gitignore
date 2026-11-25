@@ -76,3 +76,7 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# vkd3d-proton (Wine, Proton) keeps its pipeline cache in the working
+# directory unless told otherwise: made from shaders, never to be committed.
+vkd3d-proton.cache*
