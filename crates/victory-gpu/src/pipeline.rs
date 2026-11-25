@@ -63,6 +63,8 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    mesh_fallback: OnceLock<Option<victory_shader::emit::MeshFallback>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -113,6 +115,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                mesh_fallback: OnceLock::new(),
             })
         })
         .clone()
@@ -134,6 +138,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         hash: full.to_hex()[..16].to_owned(),
         container: container.to_vec(),
         translated: OnceLock::new(),
+        mesh_fallback: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
@@ -152,6 +157,20 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    pub(crate) fn mesh_fallback(&self) -> Option<&victory_shader::emit::MeshFallback> {
+        self.mesh_fallback
+            .get_or_init(|| {
+                victory_shader::emit::translate_mesh_as_compute(&self.container)
+                    .map_err(|e| e.to_string())
+                    .map_err(|error| {
+                        tracing::warn!(stage = self.stage, hash = %self.hash, %error, "mesh shader does not translate as compute");
+                        error
+                    })
+                    .ok()
+            })
+            .as_ref()
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
