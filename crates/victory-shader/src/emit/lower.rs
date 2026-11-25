@@ -3287,6 +3287,52 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, zeros, signed, r)
     }
 
+    // Preserve the rounding direction of an exact finite half-precision
+    // multiply-add before the final nearest-even conversion to f16.
+    fn f16_fma_round_to_odd(&mut self, a: V, b: V, acc: V) -> V {
+        let c = self.cur;
+
+        // The product of two finite halves is exact in f32.
+        let p = self.s.m.bin(c, Bin::Mul, a, b);
+        let sum = self.fmad(a, b, acc);
+
+        // TwoSum: recover the rounding error of p + acc.
+        let bv = self.s.m.bin(c, Bin::Sub, sum, p);
+        let av = self.s.m.bin(c, Bin::Sub, sum, bv);
+        let br = self.s.m.bin(c, Bin::Sub, acc, bv);
+        let ar = self.s.m.bin(c, Bin::Sub, p, av);
+        let err = self.s.m.bin(c, Bin::Add, ar, br);
+
+        let bits = self.as_int(sum);
+        let err_bits = self.as_int(err);
+
+        let zero = self.s.m.i32(0);
+        let one = self.s.m.i32(1);
+        let fzero = self.s.m.f32(0);
+
+        // Ordered comparisons leave non-finite results unchanged
+        // when the residual is NaN.
+        let positive = self.s.m.cmp(c, pred::OGT, err, fzero);
+        let negative = self.s.m.cmp(c, pred::OLT, err, fzero);
+        let inexact = self.s.m.bin(c, Bin::Or, positive, negative);
+
+        // An odd significand already preserves the rounding direction.
+        let lsb = self.s.m.bin(c, Bin::And, bits, one);
+        let even = self.s.m.cmp(c, pred::EQ, lsb, zero);
+        let adjust = self.s.m.bin(c, Bin::And, inexact, even);
+
+        // Opposite signs mean the residual points toward zero.
+        let signs = self.s.m.bin(c, Bin::Xor, bits, err_bits);
+        let toward_zero = self.s.m.cmp(c, pred::SLT, signs, zero);
+
+        let down = self.s.m.bin(c, Bin::Sub, bits, one);
+        let up = self.s.m.bin(c, Bin::Add, bits, one);
+        let stepped = self.s.m.select(c, toward_zero, down, up);
+
+        let result = self.s.m.select(c, adjust, stepped, bits);
+        self.as_float(result)
+    }
+
     fn fmad(&mut self, a: V, b: V, c: V) -> V {
         self.s.op(
             self.cur,
@@ -7878,6 +7924,9 @@ impl<'a> Lower<'a> {
                 self.half_fsrc(inst, 2)?
             };
             let r = match name {
+                "v_fma_f16" if f16_nearest_on() && v.omod == 0 && !v.clamp => {
+                    self.f16_fma_round_to_odd(a, b, acc)
+                }
                 // shortcut: fused f16 multiply-adds as FMad in f32 (the
                 // product is exact; the sum rounds twice).
                 "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
