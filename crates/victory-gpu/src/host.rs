@@ -738,6 +738,7 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    mesh_scratch: Mutex<MeshScratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -1317,6 +1318,150 @@ impl Drop for Scratch {
 }
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+
+/// Default-heap memory a list's mesh fallback draws write and read: per
+/// [`ScratchPool`], chunks handed out in order, each draw getting a region
+/// of its own (see [`HostList::mesh_scratch`]).
+#[derive(Default)]
+struct MeshScratch {
+    pools: [Pool; 2],
+}
+
+/// Which memory a mesh fallback draw asks for: what the mesh program writes,
+/// or the commands an indirect draw executes. Kept apart because a draw
+/// moves the chunks it uses between states, and an indirect draw reads its
+/// commands (indirect arguments) while it writes its data (UAV).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ScratchPool {
+    Data = 0,
+    Commands = 1,
+}
+
+/// Chunks (buffer, size, bytes used since the reset, used as a UAV since the
+/// reset) and the chunk being filled.
+#[derive(Default)]
+struct Pool {
+    chunks: Vec<(ID3D12Resource, u64, u64, bool)>,
+    current: usize,
+}
+
+/// A mesh fallback chunk's size; bigger regions get a chunk of their own
+/// (a power of two, kept for later draws).
+const MESH_CHUNK: u64 = 16 << 20;
+
+/// Mesh fallback chunks no list holds, in COMMON, by size. A list takes
+/// its chunks from here and gives them back when it is reset, so the
+/// title's many lists share a few chunks instead of each keeping its own
+/// (dozens of lists × 64 MiB ran an 8 GB GPU out of memory).
+static FREE_CHUNKS: std::sync::Mutex<Vec<(ID3D12Resource, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// What [`FREE_CHUNKS`] keeps at most; chunks past it wait in
+/// [`RELEASING`] before they are released.
+fn free_chunks_max() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // VICTORY_MESH_FREE_MIB overrides (local tuning on 8 GB cards).
+    *V.get_or_init(|| {
+        std::env::var("VICTORY_MESH_FREE_MIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(512 << 20, |m| m << 20)
+    })
+}
+
+/// Chunks to release, per list reset, oldest first.
+#[allow(clippy::type_complexity)]
+static RELEASING: std::sync::Mutex<std::collections::VecDeque<Vec<(ID3D12Resource, u64)>>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// How many list resets a chunk waits before it is released.
+fn release_delay() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    // VICTORY_MESH_RELEASE_DELAY overrides (list resets a chunk waits).
+    *V.get_or_init(|| {
+        std::env::var("VICTORY_MESH_RELEASE_DELAY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128)
+    })
+}
+
+/// Bytes of mesh fallback chunks alive (held, free or waiting).
+static MESH_CHUNK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A region of a list's mesh fallback memory.
+pub(crate) struct ScratchRegion {
+    pub(crate) buffer: ID3D12Resource,
+    /// Byte offset of the region in `buffer`.
+    pub(crate) offset: u64,
+    /// The list uses `buffer` for the first time since its reset: it is in
+    /// COMMON (new, or decayed after the list last ran) and must move to
+    /// UNORDERED_ACCESS first. Otherwise it is in UNORDERED_ACCESS.
+    pub(crate) first: bool,
+}
+
+impl Pool {
+    /// A region of at least `len` bytes; `make` makes a chunk of a size.
+    fn region(
+        &mut self,
+        len: u64,
+        make: impl FnOnce(u64) -> Option<ID3D12Resource>,
+    ) -> Option<ScratchRegion> {
+        let len = len.max(16).next_multiple_of(256);
+        // The chunk being filled, else the next one big enough (chunks past
+        // the current one are unused since the reset), else a new one.
+        let mut at = self.current;
+        while at < self.chunks.len() {
+            let (_, size, used, _) = &self.chunks[at];
+            if used + len <= *size {
+                break;
+            }
+            at += 1;
+        }
+        if at == self.chunks.len() {
+            let size = MESH_CHUNK.max(len.next_power_of_two());
+            self.chunks.push((make(size)?, size, 0, false));
+        }
+        self.current = at;
+        let (buffer, _, used, touched) = &mut self.chunks[at];
+        let region = ScratchRegion {
+            buffer: buffer.clone(),
+            offset: *used,
+            first: !*touched,
+        };
+        *used += len;
+        *touched = true;
+        Some(region)
+    }
+
+    #[cfg(test)]
+    fn reset(&mut self) {
+        for (_, _, used, touched) in &mut self.chunks {
+            (*used, *touched) = (0, false);
+        }
+        self.current = 0;
+    }
+
+    /// Hands every chunk back (after the list's last submission finished:
+    /// they have decayed to COMMON), for any list to take
+    /// ([`FREE_CHUNKS`]).
+    fn release(&mut self) -> impl Iterator<Item = (ID3D12Resource, u64)> + '_ {
+        self.current = 0;
+        self.chunks.drain(..).map(|(buffer, size, _, _)| (buffer, size))
+    }
+
+    /// Every region free again within the list: the draw that used them
+    /// moved their chunks back to UNORDERED_ACCESS, a transition that
+    /// waits for its reads, so later draws may write the same bytes.
+    /// Chunks keep their state (`touched`).
+    fn recycle(&mut self) {
+        for (_, _, used, _) in &mut self.chunks {
+            *used = 0;
+        }
+        self.current = 0;
+    }
+}
+
+
 /// A list's first chunk when the chunks are shared ([`scratch_pool`]): most
 /// lists put a few constants or a rectangle's corners there, and every
 /// list that did took 4 MiB of the PC's memory for it.
@@ -2847,6 +2992,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                mesh_scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
@@ -4463,6 +4609,28 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        {
+            let mut scratch = self.mesh_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            let mut free = FREE_CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+            let mut late = RELEASING.lock().unwrap_or_else(|e| e.into_inner());
+            let mut excess = Vec::new();
+            for pool in &mut scratch.pools {
+                for (buffer, size) in pool.release() {
+                    let held: u64 = free.iter().map(|(_, size)| *size).sum();
+                    if held + size <= free_chunks_max() {
+                        free.push((buffer, size));
+                    } else {
+                        excess.push((buffer, size));
+                    }
+                }
+            }
+            late.push_back(excess);
+            while late.len() > release_delay() {
+                for (_, size) in late.pop_front().unwrap_or_default() {
+                    MESH_CHUNK_BYTES.fetch_sub(size, Ordering::Relaxed);
+                }
+            }
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -5000,6 +5168,43 @@ impl HostList {
 
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
+    /// After the list runs the chunks decay to COMMON, as buffers do.
+    pub(crate) fn mesh_scratch(&self, len: u64, pool: ScratchPool) -> Option<ScratchRegion> {
+        let mut s = self.mesh_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        s.pools[pool as usize].region(len, |size| {
+            // A free chunk of that size (chunk sizes are powers of two from
+            // MESH_CHUNK up), else a new one.
+            {
+                let mut free = FREE_CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(i) = free.iter().position(|&(_, s)| s == size) {
+                    return Some(free.swap_remove(i).0);
+                }
+            }
+            let buffer = host()?.uav_buffer(size)?;
+            let total =
+                MESH_CHUNK_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size;
+            tracing::info!(size, total_mib = total >> 20, "mesh fallback chunk made");
+            name(&buffer, || format!("mesh fallback {pool:?} {size:#x}"));
+            Some(buffer)
+        })
+    }
+
+    /// After a mesh fallback draw has moved every chunk it used back to
+    /// UNORDERED_ACCESS: the next draws reuse the same memory instead of
+    /// each taking new regions (thousands of draws per list would otherwise
+    /// hold gigabytes until the list is reset).
+    pub(crate) fn mesh_scratch_recycle(&self) {
+        self.mesh_scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pools
+            .iter_mut()
+            .for_each(Pool::recycle);
+    }
+
+    /// The host address of the list's indirect-work budget, zeroed at each
+    /// submission of the list from the first use after a reset on.
+
     pub(crate) fn budget(&self) -> Option<u64> {
         let (buffer, data) = self
             .budget

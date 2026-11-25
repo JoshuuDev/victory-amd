@@ -12,6 +12,8 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Resource space reserved for the mesh-as-compute fallback buffers.
+pub const MESH_OUT_SPACE: u32 = 2;
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -146,6 +148,9 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    pub mesh_as_compute: bool,
+    mesh_out: [Option<V>; 3],
+    mesh_in: [Option<V>; 3],
     /// A geometry shader (the rectangle stage, `rect.rs`); `pixel` is false.
     pub geometry: Option<Geometry>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
@@ -210,6 +215,9 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            mesh_as_compute: false,
+            mesh_out: [None; 3],
+            mesh_in: [None; 3],
             geometry: None,
             user_data: 0,
             samplers: 0,
@@ -358,6 +366,56 @@ impl Shader {
         h
     }
 
+    /// The handle of mesh output UAV `u<register>` in [`MESH_OUT_SPACE`] (a
+    /// raw buffer), made in the entry block.
+    pub fn mesh_out_handle(&mut self, register: u8) -> V {
+        if let Some(h) = self.mesh_out[usize::from(register)] {
+            return h;
+        }
+        let r = self.m.i32(u32::from(register));
+        let bind = [r, r, self.m.i32(MESH_OUT_SPACE), self.m.i8(1)]; // UAV
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.mesh_out[usize::from(register)] = Some(h);
+        h
+    }
+
+    /// The handle of `t<register>` in [`MESH_OUT_SPACE`] (a raw buffer: what
+    /// the mesh program wrote to `u<register>`), made in the entry block.
+    pub fn mesh_in_handle(&mut self, register: u8) -> V {
+        if let Some(h) = self.mesh_in[usize::from(register)] {
+            return h;
+        }
+        let r = self.m.i32(u32::from(register));
+        let bind = [r, r, self.m.i32(MESH_OUT_SPACE), self.m.i8(0)]; // SRV
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.mesh_in[usize::from(register)] = Some(h);
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -451,6 +509,13 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        // A mesh program lowered as compute writes its signatures to UAVs.
+        if self.mesh_as_compute {
+            self.mesh = None;
+            self.inputs.clear();
+            self.outputs.clear();
+            self.prims.clear();
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -485,6 +550,8 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
+            || self.mesh_out.iter().any(Option::is_some)
+            || self.mesh_in.iter().any(Option::is_some)
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -539,37 +606,46 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() {
+            // Raw buffer SRVs: (space, register).
+            let mut raw: Vec<(u32, u32)> = self
+                .root_srvs
+                .iter()
+                .map(|r| (ROOT_CBV_SPACE, u32::from(r.0)))
+                .collect();
+            for r in 0..3u32 {
+                if self.mesh_in[r as usize].is_some() {
+                    raw.push((MESH_OUT_SPACE, r));
+                }
+            }
+            if !raw.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                for (n, (space, register)) in raw.into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, register)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(i32c(&mut self, 0)),
                         None,
                     ];
                     list.push(Some(self.m.md_node(ops)));
-                    bindings.push(Binding {
-                        kind: 4,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
-                        dxil_kind: 11,
-                    });
+                    bindings.push(Binding { kind: 4, space, register, dxil_kind: 11 });
                 }
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() {
+            let mesh_uavs: Vec<u32> = (0..3u32)
+                .filter(|&r| self.mesh_out[r as usize].is_some())
+                .collect();
+            if !self.root_uavs.is_empty() || !mesh_uavs.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -602,6 +678,21 @@ impl Shader {
                         register: u32::from(slot),
                         dxil_kind: 11,
                     });
+                }
+                for (n, register) in mesh_uavs.into_iter().enumerate() {
+                    let id = self.root_uavs.len() as u32 + n as u32;
+                    let ops = vec![
+                        Some(i32c(&mut self, id)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, MESH_OUT_SPACE)),
+                        Some(i32c(&mut self, register)),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)),
+                        Some(no), Some(no), Some(no), None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding { kind: 7, space: MESH_OUT_SPACE, register, dxil_kind: 11 });
                 }
                 uavs = Some(self.m.md_node(list));
             }

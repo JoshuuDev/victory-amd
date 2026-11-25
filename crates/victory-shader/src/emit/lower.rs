@@ -78,6 +78,9 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// Mesh: emit a compute shader that writes the outputs to the mesh
+    /// output UAVs ([`super::MeshLayout`]) instead of a mesh shader.
+    pub mesh_as_compute: bool,
 }
 
 enum Stop {
@@ -107,6 +110,9 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
+const MESH_VERTICES: u8 = 0;
+const MESH_INDICES: u8 = 1;
+const MESH_PRIMITIVES: u8 = 2;
 
 /// The f16 bits of inline float constant `c` (240..=248: 0.5, -0.5, 1.0,
 /// -1.0, 2.0, -2.0, 4.0, -4.0, 1/(2 pi)).
@@ -1432,6 +1438,7 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
+            s.mesh_as_compute = x.mesh_as_compute;
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -4135,8 +4142,10 @@ impl<'a> Lower<'a> {
             self.s.m.i32(mesh.max_vertices),
             self.s.m.i32(mesh.max_primitives),
         );
-        self.s
-            .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        if !self.s.mesh_as_compute {
+            self.s
+                .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        }
         let flat = self.mesh_thread();
         let z = self.s.m.i32(0);
         // Every primitive of the declared count starts culled, also those
@@ -4155,14 +4164,11 @@ impl<'a> Lower<'a> {
             let guard = ((pass + 1) * threads > mesh.max_primitives)
                 .then(|| self.s.m.cmp(self.cur, pred::IULT, index, p));
             let at = self.begin_guarded(guard);
-            self.s.op(
-                self.cur,
-                "emitIndices",
-                Attr::NoUnwind,
-                void,
-                169,
-                &[index, z, z, z],
-            );
+            if self.s.mesh_as_compute {
+                self.mesh_out_store(MESH_INDICES, index, &[z, z, z]);
+            } else {
+                self.s.op(self.cur, "emitIndices", Attr::NoUnwind, void, 169, &[index, z, z, z]);
+            }
             self.end_guarded(at, &[]);
         }
         Ok(())
@@ -4185,6 +4191,41 @@ impl<'a> Lower<'a> {
         );
         self.flat = Some(f);
         f
+    }
+
+    fn mesh_group_id(&mut self) -> V {
+        let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else { unreachable!() };
+        g
+    }
+
+    fn mesh_out_store_at(&mut self, out: u8, slot: V, dword: u32, vals: &[V]) {
+        let mesh = self.s.mesh.expect("mesh");
+        let (per_group, record) = match out {
+            MESH_VERTICES => (mesh.max_vertices, 4 * self.s.outputs.len() as u32),
+            MESH_INDICES => (mesh.max_primitives, 3),
+            _ => (mesh.max_primitives, 4 * self.s.prims.len() as u32),
+        };
+        let c = self.cur;
+        let g = self.mesh_group_id();
+        let n = self.s.m.i32(per_group);
+        let first = self.s.m.bin(c, Bin::Mul, g, n);
+        let index = self.s.m.bin(c, Bin::Add, first, slot);
+        let stride = self.s.m.i32(record * 4);
+        let base = self.s.m.bin(c, Bin::Mul, index, stride);
+        let within = self.s.m.i32(dword * 4);
+        let off = self.s.m.bin(c, Bin::Add, base, within);
+        let h = self.s.mesh_out_handle(out);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mut args = vec![h, off, iu];
+        args.extend_from_slice(vals);
+        args.resize(7, iu);
+        args.push(self.s.m.i8((1u8 << vals.len()) - 1));
+        args.push(self.s.m.i32(4));
+        self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, self.s.t.void, 140, &args);
+    }
+
+    fn mesh_out_store(&mut self, out: u8, slot: V, vals: &[V]) {
+        self.mesh_out_store_at(out, slot, 0, vals);
     }
 
     /// The console wave size.
@@ -10569,7 +10610,19 @@ impl<'a> Lower<'a> {
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
-            let (suffix, x) = match el.comp {
+            let comp = el.comp;
+            if self.s.mesh_as_compute {
+                // The record holds every output's four dwords, raw bits.
+                let out = if primitive {
+                    MESH_PRIMITIVES
+                } else {
+                    MESH_VERTICES
+                };
+                let slot = self.mesh_thread();
+                self.mesh_out_store_at(out, slot, id as u32 * 4 + u32::from(col), &[x]);
+                continue;
+            }
+            let (suffix, x) = match comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
@@ -10635,11 +10688,22 @@ impl<'a> Lower<'a> {
             m.max_vertices
                 .min(self.s.threads.map_or(u32::MAX, |t| t[0]))
         });
+        let first = if self.s.mesh_as_compute {
+            let group = self.mesh_group_id();
+            let max = self.s.mesh.expect("mesh").max_vertices;
+            let max = self.s.m.i32(max);
+            Some(self.s.m.bin(c, Bin::Mul, group, max))
+        } else {
+            None
+        };
         let mut indices = [z; 3];
         for (k, slot) in indices.iter_mut().enumerate() {
             let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
+            let i = if let Some(first) = first {
+                self.s.m.bin(c, Bin::Add, i, first)
+            } else { i };
             if let Some(n) = written {
                 let n = self.s.m.i32(n);
                 let past = self.s.m.cmp(c, pred::IUGE, i, n);
@@ -10647,13 +10711,15 @@ impl<'a> Lower<'a> {
             }
             *slot = i;
         }
-        let mut args = vec![flat];
-        for i in indices {
-            args.push(self.s.m.select(c, culled, z, i));
+        let indices = indices.map(|i| self.s.m.select(c, culled, z, i));
+        if self.s.mesh_as_compute {
+            self.mesh_out_store(MESH_INDICES, flat, &indices);
+        } else {
+            let mut args = vec![flat];
+            args.extend(indices);
+            let void = self.s.t.void;
+            self.s.op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
         }
-        let void = self.s.t.void;
-        self.s
-            .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
         self.end_guarded(at, &[]);
         Ok(())
     }
@@ -11171,6 +11237,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            mesh_as_compute: false,
         })
         .map(|_| ())
     }
@@ -11221,6 +11288,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            mesh_as_compute: false,
         })
     }
 
@@ -11332,6 +11400,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            mesh_as_compute: false,
         }).unwrap();
 
         let container =
