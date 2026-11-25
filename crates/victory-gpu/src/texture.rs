@@ -440,17 +440,26 @@ pub(crate) fn let_go_idle() {
     // is reset: one only the table holds is named by no list, recorded or
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
-        let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES);
-        if !keep {
+    // Not dropped here: kept until the submissions running now have finished
+    // (`crate::host::retire`), as the host copies are.
+    let mut gone = Vec::new();
+    let keys: Vec<_> = map
+        .iter()
+        .filter(|(_, s)| Arc::strong_count(s) == 1 && crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES))
+        .map(|(k, _)| *k)
+        .collect();
+    for key in keys {
+        if let Some(s) = map.remove(&key) {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
             went += 1;
             bytes += s.bytes;
+            gone.push(s);
         }
-        keep
-    });
+    }
+    for s in gone {
+        crate::host::retire(s);
+    }
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }

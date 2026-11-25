@@ -908,6 +908,50 @@ mod difference_tests {
 /// The unit shader writes are looked for and put back in.
 const PIECE: usize = 64 << 10;
 
+/// One 64 KiB piece the shaders changed (offset `at` of a copy at `data`,
+/// whose snapshot's byte for offset `x` is at `snap + x`; the copy starts at
+/// title address `start`): from the first byte that differs to the last,
+/// the GPU's bytes go into title memory, where the title has not its own,
+/// and the title's into the copy. Returns the bytes written to title memory.
+/// Pieces are disjoint, so several may run at once.
+fn put_back_piece(data: usize, snap: usize, start: usize, at: usize, n: usize, title: &mut [u8]) -> usize {
+    // SAFETY: inside the mapping and the snapshot, both held for the range
+    // (`copy_back_done` comes after); no one else writes this piece.
+    let (host, old) = unsafe {
+        (
+            std::slice::from_raw_parts_mut((data + at) as *mut u8, n),
+            std::slice::from_raw_parts((snap + at) as *const u8, n),
+        )
+    };
+    let Some(first) = first_difference(host, old) else {
+        return 0;
+    };
+    let last = last_difference(host, old).unwrap_or(first);
+    let (at, n) = (at + first, last + 1 - first);
+    let (host, old) = (&mut host[first..=last], &old[first..=last]);
+    let title = &mut title[..n];
+    if !crate::host::read_into((start + at) as *const u8, title) {
+        return 0;
+    }
+    // Without a branch, so the loop runs many bytes at a time: the GPU's
+    // byte where the copy's byte is not what it was before the submission,
+    // else the title's.
+    let mut differs = 0u8;
+    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+        let gpu = if *h != *o { 0xffu8 } else { 0 };
+        let merged = (*t & !gpu) | (*h & gpu);
+        differs |= merged ^ *t;
+        *t = merged;
+        *h = merged;
+    }
+    if differs != 0 {
+        crate::watch::writing(start + at, n);
+        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        return n;
+    }
+    0
+}
+
 /// Copies `len` bytes, on several threads if they are many: a snapshot of
 /// the world's big heap is 100-170 MB per submission, 2-4 GB a frame, and
 /// one thread copies some 8 GB/s.
@@ -1438,13 +1482,13 @@ fn keeps() -> bool {
 
 /// Bytes of the snapshots kept, and the most that may be.
 static KEPT_BYTES: AtomicU64 = AtomicU64::new(0);
-/// `VICTORY_KEEP_SNAPSHOTS_MB`, 256 unless set (it was 768: run 80, with
+/// `VICTORY_KEEP_SNAPSHOTS_MB`, 1024 unless set (256 before; it was 768: run 80, with
 /// kept snapshots beside copies in the card's memory, ran the PC out of
 /// memory in 27 s; kept snapshots are the PC's memory, all of it resident).
 fn kept_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_KEEP_SNAPSHOTS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 20
+        std::env::var("VICTORY_KEEP_SNAPSHOTS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) << 20
     })
 }
 
@@ -1831,9 +1875,22 @@ impl Shadow {
                     let (lo, hi) = self.piece(piece);
                     let whole = from <= lo && hi <= to;
                     let (lo, hi) = (lo.max(from), hi.min(to));
-                    // SAFETY: as below; `hi <= total`.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                    if wide_back() {
+                        // Taken with the submission's other snapshots on
+                        // several threads (`take_snapshots`), before its
+                        // lists go to the card; a declared range is left
+                        // alone by every refresh until then.
+                        let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
+                        let (data, snap) = (self.data as usize, snapshot.as_mut_ptr() as usize);
+                        match snaps.last_mut() {
+                            Some(last) if last.0 + last.2 == data + lo && last.1 + last.2 == snap + lo => last.2 += hi - lo,
+                            _ => snaps.push((data + lo, snap + lo, hi - lo)),
+                        }
+                    } else {
+                        // SAFETY: as below; `hi <= total`.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        }
                     }
                     kept.0[piece] = whole;
                 }
@@ -1914,44 +1971,32 @@ impl Shadow {
             for &(at, n) in &differing {
                 self.changed(at, at + n);
             }
-            let mut title = vec![0u8; PIECE];
-            for (at, n) in differing {
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                // From the first byte that differs to the last: title
-                // memory is read and written there only (a shader that sets
-                // a few words of a piece cost a read, a walk and a write of
-                // all 64 KiB of it).
-                let Some(first) = first_difference(host, old) else {
-                    continue;
-                };
-                let last = last_difference(host, old).unwrap_or(first);
-                let (at, n) = (at + first, last + 1 - first);
-                let (host, old) = (&mut host[first..=last], &old[first..=last]);
-                let title = &mut title[..n];
-                if !crate::host::read_into((start + at) as *const u8, title) {
-                    continue;
-                }
-                // Title memory with the GPU's bytes put in; the copy takes
-                // the title's bytes in turn.
-                // Without a branch, so the loop runs many bytes at a time:
-                // the GPU's byte where the copy's byte is not what it was
-                // before the submission, else the title's. (With the two
-                // searches above this was 44 ms a frame for 970 pieces.)
-                let mut differs = 0u8;
-                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                    let gpu = if *h != *o { 0xffu8 } else { 0 };
-                    let merged = (*t & !gpu) | (*h & gpu);
-                    differs |= merged ^ *t;
-                    *t = merged;
-                    *h = merged;
-                }
-                if differs != 0 {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                    written += n;
+            let (data, snap) = (self.data as usize, before.as_ptr() as usize - from);
+            if differing.len() >= 8 && wide_back() {
+                // The pieces are disjoint: merged and put back on the kept
+                // threads, a share of them to a job.
+                let total = Arc::new(AtomicU64::new(0));
+                let per = differing.len().div_ceil(16).max(4);
+                let jobs: Vec<Job> = differing
+                    .chunks(per)
+                    .map(|share| {
+                        let (share, total) = (share.to_vec(), total.clone());
+                        Box::new(move || {
+                            let mut title = vec![0u8; PIECE];
+                            let mut mine = 0;
+                            for (at, n) in share {
+                                mine += put_back_piece(data, snap, start, at, n, &mut title);
+                            }
+                            total.fetch_add(mine as u64, Ordering::Relaxed);
+                        }) as Job
+                    })
+                    .collect();
+                wide(jobs);
+                written += total.load(Ordering::Relaxed) as usize;
+            } else {
+                let mut title = vec![0u8; PIECE];
+                for (at, n) in differing {
+                    written += put_back_piece(data, snap, start, at, n, &mut title);
                 }
             }
             // Our write shows as a title write at the copy's next refresh,
